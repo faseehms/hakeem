@@ -1,0 +1,474 @@
+import 'dotenv/config';
+import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+const MODEL = process.env.GEMINI_MODEL || 'gemini-4-hydrogen';
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+function getAiClient() {
+  const rawKey = process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim() || '';
+  const apiKey = rawKey.replace(/^["']|["']$/g, '');
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    throw new Error('GEMINI_API_KEY_MISSING');
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: { 'User-Agent': 'aistudio-build' },
+    },
+  });
+}
+
+function formatGeminiError(error, fallbackMsg) {
+  const message = error instanceof Error ? error.message : fallbackMsg;
+  const serialized = `${message} ${typeof error === 'object' && error !== null ? JSON.stringify(error) : ''}`;
+
+  if (
+    serialized.includes('GEMINI_API_KEY_MISSING') ||
+    serialized.includes('API_KEY_INVALID') ||
+    serialized.includes('API key not valid') ||
+    serialized.includes('ACCESS_TOKEN_TYPE_UNSUPPORTED') ||
+    serialized.includes('UNAUTHENTICATED') ||
+    serialized.includes('"code":401') ||
+    serialized.includes('PERMISSION_DENIED')
+  ) {
+    return {
+      status: 502,
+      message: 'مفتاح Gemini API غير صالح أو غير مفعّل في متغيرات البيئة على الخادم.',
+    };
+  }
+
+  if (serialized.includes('RESOURCE_EXHAUSTED') || serialized.includes('"code":429')) {
+    return {
+      status: 429,
+      message: 'تم بلوغ حد الطلبات المؤقت للخدمة، يرجى المحاولة بعد قليل.',
+    };
+  }
+
+  return {
+    status: 500,
+    message: message.startsWith('{') ? fallbackMsg : message || fallbackMsg,
+  };
+}
+
+function writeSse(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function extractPartialJsonString(buffer, fieldName) {
+  const match = new RegExp(`"${fieldName}"\\s*:\\s*"`).exec(buffer);
+  if (!match) return null;
+  let i = match.index + match[0].length;
+  let out = '';
+  while (i < buffer.length) {
+    const ch = buffer[i];
+    if (ch === '\\') {
+      if (i + 1 >= buffer.length) break;
+      const next = buffer[i + 1];
+      if (next === 'n') out += '\n';
+      else if (next === 'r') out += '\r';
+      else if (next === 't') out += '\t';
+      else out += next;
+      i += 2;
+    } else if (ch === '"') {
+      break;
+    } else {
+      out += ch;
+      i++;
+    }
+  }
+  return out;
+}
+
+function detectTextNature(text) {
+  const trimmed = (text || '').trim();
+  const hasUthmani = /[\u0670\u0671\u06D6-\u06ED\uFD3E\uFD3F]/.test(trimmed);
+  const hasQuranQuote =
+    /(?:قال\s+(?:الله\s+)?تعالى|قوله\s+تعالى)/.test(trimmed) && /[«"﴿:]/.test(trimmed);
+  const hasTwoHemistichs = trimmed
+    .split(/\r?\n/)
+    .some(
+      (l) =>
+        l
+          .split(/\t|\s{3,}|\s*\*{2,}\s*/)
+          .filter((p) => p.trim().split(/\s+/).length >= 3).length === 2,
+    );
+  const hasPoetryCues =
+    /(قفا نبك|سقط اللوى|وليل كموج البحر|على قدر أهل العزم|الخيل والليل والبيداء)/.test(trimmed);
+
+  return {
+    containsQuranicText: hasUthmani || hasQuranQuote,
+    requiresDeepThinking: hasTwoHemistichs || hasPoetryCues,
+  };
+}
+
+function sendError(res, err, fallback, sseStarted = false) {
+  const formatted = formatGeminiError(err, fallback);
+  if (sseStarted) {
+    writeSse(res, 'error', { error: formatted.message });
+    res.end();
+    return;
+  }
+  res.status(formatted.status).json({ error: formatted.message });
+}
+
+const PROOFREAD_SCHEMA = {
+  type: Type.OBJECT,
+  propertyOrdering: [
+    'containsQuranicText',
+    'isPoetryOrRhetoric',
+    'correctedText',
+    'summary',
+    'overallAssessment',
+    'corrections',
+    'rhetoricalInsights',
+  ],
+  properties: {
+    containsQuranicText: { type: Type.BOOLEAN },
+    isPoetryOrRhetoric: { type: Type.BOOLEAN },
+    correctedText: { type: Type.STRING },
+    summary: { type: Type.STRING },
+    overallAssessment: { type: Type.STRING },
+    corrections: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          original: { type: Type.STRING },
+          corrected: { type: Type.STRING },
+          category: { type: Type.STRING },
+          ruleTitle: { type: Type.STRING },
+          explanation: { type: Type.STRING },
+          context: { type: Type.STRING },
+        },
+        required: ['original', 'corrected', 'category', 'ruleTitle', 'explanation', 'context'],
+      },
+    },
+    rhetoricalInsights: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          excerpt: { type: Type.STRING },
+          phenomenon: { type: Type.STRING },
+          rhetoricalFacet: { type: Type.STRING },
+          grammaticalInterpretations: { type: Type.STRING },
+        },
+        required: ['excerpt', 'phenomenon', 'rhetoricalFacet', 'grammaticalInterpretations'],
+      },
+    },
+  },
+  required: [
+    'containsQuranicText',
+    'isPoetryOrRhetoric',
+    'correctedText',
+    'summary',
+    'overallAssessment',
+    'corrections',
+    'rhetoricalInsights',
+  ],
+};
+
+app.get('/api/health', (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.post('/api/proofread/stream', async (req, res) => {
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!text) return res.status(400).json({ error: 'يرجى إدخال نص عربي للتدقيق.' });
+
+  const mode = req.body?.mode === 'orthography_grammar' ? 'orthography_grammar' : 'comprehensive';
+  const preserveStyle = req.body?.preserveStyle !== false;
+  const nature = detectTextNature(text);
+
+  const systemInstruction = [
+    'أنت مدقق لغوي عربي خبير في النحو والصرف والإملاء وعلامات الترقيم والبلاغة.',
+    mode === 'orthography_grammar'
+      ? 'ركّز على الأخطاء الإملائية والنحوية الصريحة دون تعديلات أسلوبية تفضيلية.'
+      : 'صحّح الأخطاء الإملائية والنحوية وعلامات الترقيم بدقة وإيجاز.',
+    preserveStyle ? 'حافظ على أسلوب الكاتب وصياغته الأصلية قدر الإمكان.' : '',
+    'إذا تضمّن النص آيات قرآنية، التزم التزاماً تاماً بالرسم العثماني والقراءات المتواترة ولا تعدّله ولا تعتبره خطأً، واضبط containsQuranicText على true.',
+    'إذا كان النص شعراً عمودياً أو تفعيلة أو نصاً بلاغياً تراثياً، فاستوعب الضرورات الشعرية والتقديم والتأخير والحذف والمجاز، واشرح أوجهها وتأويلاتها في rhetoricalInsights على منهج سيبويه وابن جني، واضبط isPoetryOrRhetoric على true.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  let sseStarted = false;
+  try {
+    const ai = getAiClient();
+    const stream = await ai.models.generateContentStream({
+      model: MODEL,
+      contents: `دقّق النص العربي التالي:\n\n"""\n${text}\n"""`,
+      config: {
+        systemInstruction,
+        thinkingConfig: {
+          thinkingLevel: nature.requiresDeepThinking ? ThinkingLevel.HIGH : ThinkingLevel.LOW,
+        },
+        responseMimeType: 'application/json',
+        responseSchema: PROOFREAD_SCHEMA,
+      },
+    });
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    sseStarted = true;
+
+    let buffer = '';
+    let lastCorrected = '';
+    let lastSummary = '';
+
+    for await (const chunk of stream) {
+      const part = chunk.text ?? '';
+      if (!part) continue;
+      buffer += part;
+
+      const c = extractPartialJsonString(buffer, 'correctedText');
+      if (c !== null && c !== lastCorrected) {
+        lastCorrected = c;
+        writeSse(res, 'correctedText', { text: c });
+      }
+      const s = extractPartialJsonString(buffer, 'summary');
+      if (s !== null && s !== lastSummary) {
+        lastSummary = s;
+        writeSse(res, 'summary', { text: s });
+      }
+    }
+
+    const parsed = JSON.parse((buffer || '{}').trim());
+    writeSse(res, 'done', {
+      result: {
+        correctedText: parsed.correctedText || text,
+        summary: parsed.summary || '',
+        overallAssessment: parsed.overallAssessment || 'minor_edits',
+        containsQuranicText: Boolean(parsed.containsQuranicText || nature.containsQuranicText),
+        isPoetryOrRhetoric: Boolean(parsed.isPoetryOrRhetoric || nature.requiresDeepThinking),
+        corrections: Array.isArray(parsed.corrections) ? parsed.corrections : [],
+        rhetoricalInsights: Array.isArray(parsed.rhetoricalInsights) ? parsed.rhetoricalInsights : [],
+      },
+    });
+    res.end();
+  } catch (err) {
+    sendError(res, err, 'تعذّر إتمام التدقيق اللغوي.', sseStarted);
+  }
+});
+
+app.post('/api/tashkeel/stream', async (req, res) => {
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!text) return res.status(400).json({ error: 'يرجى إدخال نص عربي للتشكيل.' });
+
+  let sseStarted = false;
+  try {
+    const ai = getAiClient();
+    const stream = await ai.models.generateContentStream({
+      model: MODEL,
+      contents: `اشكل النص العربي التالي تشكيلاً تاماً وكاملاً:\n\n"""\n${text}\n"""`,
+      config: {
+        systemInstruction:
+          'أنت عالم نحو وصرف عربي. اضبط كل حرف في النص بالحركات النحوية والصرفية الصحيحة دون تغيير الألفاظ.',
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            vocalizedText: { type: Type.STRING },
+            notes: { type: Type.STRING },
+          },
+          required: ['vocalizedText', 'notes'],
+        },
+      },
+    });
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    sseStarted = true;
+
+    let buffer = '';
+    let lastVocalized = '';
+    for await (const chunk of stream) {
+      buffer += chunk.text ?? '';
+      const v = extractPartialJsonString(buffer, 'vocalizedText');
+      if (v !== null && v !== lastVocalized) {
+        lastVocalized = v;
+        writeSse(res, 'vocalizedText', { text: v });
+      }
+    }
+
+    const parsed = JSON.parse((buffer || '{}').trim());
+    writeSse(res, 'done', {
+      vocalizedText: parsed.vocalizedText || text,
+      notes: parsed.notes || '',
+    });
+    res.end();
+  } catch (err) {
+    sendError(res, err, 'تعذّر تشكيل النص.', sseStarted);
+  }
+});
+
+app.post('/api/irab', async (req, res) => {
+  const targetText = typeof req.body?.targetText === 'string' ? req.body.targetText.trim() : '';
+  if (!targetText) return res.status(400).json({ error: 'يرجى تحديد كلمة أو جملة للإعراب.' });
+
+  try {
+    const ai = getAiClient();
+    const response = await ai.models.generateContent({
+      model: MODEL,
+      contents: `أعرب النص التالي إعراباً مفصلاً:\n«${targetText}»`,
+      config: {
+        systemInstruction: 'أنت أستاذ متخصص في النحو العربي والإعراب التطبيقي.',
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            grammaticalRole: { type: Type.STRING },
+            detailedIrab: { type: Type.STRING },
+            morphologicalNote: { type: Type.STRING },
+            breakdown: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  token: { type: Type.STRING },
+                  role: { type: Type.STRING },
+                  irab: { type: Type.STRING },
+                },
+                required: ['token', 'role', 'irab'],
+              },
+            },
+          },
+          required: ['grammaticalRole', 'detailedIrab', 'morphologicalNote', 'breakdown'],
+        },
+      },
+    });
+    res.json(JSON.parse((response.text ?? '{}').trim()));
+  } catch (err) {
+    sendError(res, err, 'تعذّر استخراج الإعراب.');
+  }
+});
+
+app.post('/api/eloquence', async (req, res) => {
+  const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
+  if (!text) return res.status(400).json({ error: 'يرجى إدخال نص لاستخراج البدائل البلاغية.' });
+
+  try {
+    const ai = getAiClient();
+    const response = await ai.models.generateContent({
+      model: MODEL,
+      contents: `اقترح مرادفات وبدائل بلاغية أفصح للنص التالي:\n\n"""\n${text}\n"""`,
+      config: {
+        systemInstruction: 'أنت أديب وبلاغي عربي خبير في الفصاحة والبيان.',
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            overallStyleNote: { type: Type.STRING },
+            suggestions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  originalPhrase: { type: Type.STRING },
+                  rhetoricalReason: { type: Type.STRING },
+                  alternatives: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        phrase: { type: Type.STRING },
+                        nuance: { type: Type.STRING },
+                        register: { type: Type.STRING },
+                      },
+                      required: ['phrase', 'nuance', 'register'],
+                    },
+                  },
+                },
+                required: ['originalPhrase', 'rhetoricalReason', 'alternatives'],
+              },
+            },
+          },
+          required: ['overallStyleNote', 'suggestions'],
+        },
+      },
+    });
+    res.json(JSON.parse((response.text ?? '{}').trim()));
+  } catch (err) {
+    sendError(res, err, 'تعذّر استخراج البدائل البلاغية.');
+  }
+});
+
+app.post('/api/advisor/stream', async (req, res) => {
+  const message = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+  if (!message) return res.status(400).json({ error: 'يرجى كتابة سؤالك للمستشار اللغوي.' });
+
+  const editorText = typeof req.body?.editorText === 'string' ? req.body.editorText : '';
+  const correctedText = typeof req.body?.correctedText === 'string' ? req.body.correctedText : '';
+  const history = Array.isArray(req.body?.history)
+    ? req.body.history
+        .filter((h) => h && (h.role === 'user' || h.role === 'model') && typeof h.text === 'string')
+        .slice(-16)
+        .map((h) => ({ role: h.role, parts: [{ text: h.text }] }))
+    : [];
+
+  const systemInstruction = [
+    'أنت «المستشار اللغوي» في منصة «فَصيح»: عالم في النحو والصرف والبلاغة والشواهد الشعرية.',
+    'أجب بأسلوب أكاديمي عربي رصين وميسّر، واربط إجابتك بنص المحرر الحالي.',
+    editorText ? `نص المحرر الحالي:\n"""\n${editorText}\n"""` : '',
+    correctedText ? `النص المصحح:\n"""\n${correctedText}\n"""` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  let sseStarted = false;
+  try {
+    const ai = getAiClient();
+    const chat = ai.chats.create({
+      model: MODEL,
+      history,
+      config: {
+        systemInstruction,
+        thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
+      },
+    });
+
+    const stream = await chat.sendMessageStream({ message });
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    sseStarted = true;
+
+    let fullReply = '';
+    for await (const chunk of stream) {
+      const delta = chunk.text ?? '';
+      if (!delta) continue;
+      fullReply += delta;
+      writeSse(res, 'delta', { text: delta });
+    }
+    writeSse(res, 'done', { reply: fullReply.trim() });
+    res.end();
+  } catch (err) {
+    sendError(res, err, 'تعذّر الاتصال بالمستشار اللغوي.', sseStarted);
+  }
+});
+
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Faseeh server running on port ${PORT}`);
+});
